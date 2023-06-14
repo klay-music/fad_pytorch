@@ -6,7 +6,7 @@ __all__ = ['read_embeddings', 'calc_mu_sigma', 'calc_score', 'main']
 # %% ../nbs/03_fad_score.ipynb 5
 import torch 
 import argparse
-from .sqrtm import sqrtm
+from sqrtm import sqrtm
 from aeiou.core import fast_scandir
 
 # %% ../nbs/03_fad_score.ipynb 6
@@ -74,6 +74,9 @@ def main():
 
     args = parser.parse_args()
     score = calc_score( args.real_emb_path, args.fake_emb_path, method=args.method, debug=args.debug )
+    # save score to file and create it if it doesn't exist
+    with open('fad_scores.txt', 'a+') as f:
+        f.write(str(score.cpu().numpy())+'\n')
     print("FAD score = ",score.cpu().numpy())
 
 # %% ../nbs/03_fad_score.ipynb 17

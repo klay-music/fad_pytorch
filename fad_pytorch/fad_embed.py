@@ -89,12 +89,12 @@ def setup_embedder(
         clap_ckpt_path = os.getenv('CLAP_CKPT')  # NOTE: CLAP_CKPT env var overrides ckpt_file kwarg
         if clap_ckpt_path is not None:
             #print(f"Loading CLAP from {clap_ckpt_path}")
-            clap_module.load_ckpt(ckpt=clap_ckpt_path, verbose=False)
+            clap_module.load_ckpt(ckpt=clap_ckpt_path)
         else:
             print(f"No CLAP checkpoint specified, using {ckpt_file}") 
             clap_module = laion_clap.CLAP_Module(enable_fusion=False, amodel= 'HTSAT-base')
             ckpt_path = get_ckpt(ckpt_file=ckpt_file, ckpt_base_url=ckpt_base_url, ckpt_dl_path=ckpt_dl_path, accelerator=accelerator)
-            clap_module.load_ckpt(ckpt_path, verbose=False)
+            clap_module.load_ckpt(ckpt_path)
             #clap_module.load_ckpt(model_id=1, verbose=False)
         #warnings.filterwarnings("default")   # turn warnings back on. 
         embedder = clap_module # synonyms 
