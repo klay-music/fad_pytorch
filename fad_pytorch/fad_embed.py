@@ -257,7 +257,7 @@ def embed(args):
                             audio = torch.mean(audio, dim=1)   # vggish requries we convert to mono
                             embeddings = []                    # ...whoa, vggish can't even handle batches?  we have to pass 'em through singly?
                             for bi, waveform in enumerate(audio): 
-                                e =  accelerator.unwrap_model(embedder).forward(waveform.cpu().numpy(), emb_sample_rate)
+                                e =  accelerator.unwrap_model(embedder.to(torch.device("cpu"))).forward(waveform.cpu().numpy(), emb_sample_rate)
                                 embeddings.append(e) 
                             embeddings = torch.cat(embeddings, dim=0)
 
