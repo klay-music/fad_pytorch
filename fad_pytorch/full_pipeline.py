@@ -5,12 +5,16 @@ import shutil
 
 # NOTE: "export PYTORCH_ENABLE_MPS_FALLBACK=1" command might be necessary to run clap model
 
-# define variables
+# define and load variables
 num_genres = 10
-models = ["clap", "vggish"]
-nums_samples = [10, 20, 50, 100]
-noise_colors = ["pink", "white"]
-snr_values = [10, 20, 30, 40, 50]
+
+f = open('variables.json')
+variables = json.load(f)
+
+models = variables['models']
+nums_samples = variables['nums_samples']
+noise_colors = variables['noise_colors']
+snr_values = variables['snr_values']
 
 # create fakes directory (storing all fake directories with different snr values)
 if os.path.exists('fakes'):
