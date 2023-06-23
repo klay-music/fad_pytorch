@@ -297,6 +297,117 @@ def embed(args):
         del embedder
         torch.cuda.empty_cache()
         # end loop over various embedders
+    return     
+
+def embed_one_directory(args): 
+    model_choice, path, chunk_size, sr, max_batch_size, debug = args.embed_model, args.real_path, args.chunk_size, args.sr, args.batch_size, args.debug
+    
+    sample_rate = sr
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    ddps = f"[{local_rank}/{world_size}]"  # string for distributed computing info, e.g. "[1/8]" 
+
+    accelerator = Accelerator()
+    hprint = HostPrinter(accelerator)  # hprint only prints on head node
+    device = accelerator.device    # get_device()
+    hprint(f"{ddps} args = {args}")
+    hprint(f'{ddps} Using device: {device}')
+
+    model_choices = [model_choice] if model_choice != 'all' else ['clap','vggish','pann','openl3']
+    
+    for model_choice in model_choices: # loop over multiple embedders
+        hprint(f"\n ** Model_choice = {model_choice}")
+        # setup embedder and dataloader
+        embedder, emb_sample_rate = setup_embedder(model_choice, device=device, accelerator=accelerator)
+        if sr != emb_sample_rate:
+            hprint(f"\n*******\nWARNING: sr={sr} != {model_choice}'s emb_sample_rate={emb_sample_rate}. Will resample audio to the latter\n*******\n")
+            sr = emb_sample_rate
+        hprint(f"{ddps} Embedder '{model_choice}' ready to go!")
+
+        # we read audio in length args.sample_size, cut it into chunks of args,chunk_size to embed, and skip args.hop_size between chunks
+        # pads with zeros btw
+        dataset = AudioDataset(path,  sample_rate=emb_sample_rate, sample_size=args.sample_size, return_dict=True, verbose=args.verbose)
+        batch_size = min( len(dataset) // world_size , max_batch_size ) 
+        hprint(f"\nGiven max_batch_size = {max_batch_size}, len(dataset) = {len(dataset)}, and world_size = {world_size}, we'll use batch_size = {batch_size}")
+        dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        dl, embedder = accelerator.prepare( dl, embedder )  # prepare handles distributing things among GPUs
+
+        with torch.no_grad():
+            for i, data_dict in enumerate(dl):  # load audio files
+                audio_sample_batch, filename_batch = data_dict['inputs'], data_dict['filename']
+                newdir_already = False
+                if not newdir_already: 
+                    p = Path( filename_batch[0] )
+                    dir_already = True
+                    newdir = f"{p.parents[0]}_emb_{model_choice}"
+                    hprint(f"creating new directory = {newdir}")
+                    makedir(newdir) 
+                    newdir_already = True
+                # cut audio samples into chunks spaced out by hops, and loop over them
+                hop_samples = int(args.hop_size * args.sample_size)
+                hop_starts = np.arange(0, args.sample_size, hop_samples)
+                if args.max_hops <= 0:  
+                    hop_starts = hop_starts[:min(len(hop_starts), args.max_hops)]
+                if args.sample_size - hop_starts[-1] < args.hop_size: # judgement call: let's not zero-pad on the very end, rather just don't do the last hop
+                    hop_starts = hop_starts[:-1]
+                for h_ind, hop_loc in enumerate(hop_starts):               # proceed through audio file batch via chunks, skipping by hop_samples each time
+                    chunk = audio_sample_batch[:,:,hop_loc:hop_loc+hop_samples]
+                    audio = chunk 
+                    
+                    #print(f"{ddps} i = {i}/{len(real_dataset)}, filename = {filename_batch[0]}")
+                    audio = audio.to(device)
+
+
+                    if model_choice == 'clap': 
+                        while len(audio.shape) < 3: 
+                            audio = audio.unsqueeze(0) # add batch and/or channel dims 
+                        embeddings = accelerator.unwrap_model(embedder).get_audio_embedding_from_data(audio.mean(dim=1).to(device), use_tensor=True).to(audio.dtype)
+
+                    elif model_choice == "vggish":
+                        audio = torch.mean(audio, dim=1)   # vggish requries we convert to mono
+                        embeddings = []                    # ...whoa, vggish can't even handle batches?  we have to pass 'em through singly?
+                        for bi, waveform in enumerate(audio): 
+                            e =  accelerator.unwrap_model(embedder.to(torch.device("cpu"))).forward(waveform.cpu().numpy(), emb_sample_rate)
+                            embeddings.append(e) 
+                        embeddings = torch.cat(embeddings, dim=0)
+
+                    elif model_choice == "pann": 
+                        audio = torch.mean(audio, dim=1)  # mono only.  todo:  keepdim=True ?
+                        out = embedder.forward(audio, None)
+                        embeddings = out['embedding'].data
+
+                    elif model_choice == "openl3" and OPENL3_VERSION == "hugo":
+                        ##audio = torch.mean(audio, dim=1)  # mono only.
+                        embeddings = []
+                        for bi, waveform in enumerate( audio.cpu().numpy() ): # no batch processing, expects numpy 
+                            e = torchopenl3.embed(model=embedder, 
+                                audio=waveform, # shape sould be (channels, samples)
+                                sample_rate=emb_sample_rate, # sample rate of input file
+                                hop_size=1,  device=device)
+                            if debug: hprint(f"bi = {bi}, waveform.shape = {waveform.shape},  e.shape = {e.shape}") 
+                            embeddings.append(torch.tensor(e))
+                        embeddings = torch.cat(embeddings, dim=0)
+
+                    elif model_choice == "openl3" and OPENL3_VERSION == "turian":
+                        # Note: turian's can/will do multiple time-stamped embeddings if the sample_size is long enough. but our chunks/hops precludes this
+
+                        #not needed, turns out: audio = renot needed, turns out: arrange(audio, 'b c s -> b s c')       # this torchopen3 expects channels-first ordering
+                        embeddings, timestamps = torchopenl3.get_audio_embedding(audio, emb_sample_rate, model=embedder)
+                        embeddings = torch.squeeze(embeddings, 1)        # get rid of any spurious dimensions of 1 in middle position 
+
+                    else:
+                        raise ValueError(f"Unknown model_choice = {model_choice}")
+
+                    hprint(f"embeddings.shape = {embeddings.shape}")
+                    # TODO: for now we'll just dump each batch on each proc to its own file; this could be improved
+                    outfilename = f"{newdir}/emb_p{local_rank}_b{i}_h{h_ind}.pt"
+                    hprint(f"{ddps} Saving embeddings to {outfilename}")
+                    torch.save(embeddings.cpu().detach(), outfilename)
+                    
+        del embedder
+        torch.cuda.empty_cache()
+        # end loop over various embedders
     return        
 
 # %% ../nbs/02_fad_embed.ipynb 11
@@ -304,7 +415,8 @@ def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('embed_model', help='choice of embedding model(s): clap | vggish | pann | openl3 | all ', default='clap')
     parser.add_argument('real_path', help='Path of files of real audio', default='real/')
-    parser.add_argument('fake_path', help='Path of files of fake audio', default='fake/')
+    parser.add_argument('--fake_path', help='Path of files of fake audio', default='fake/')
+    parser.add_argument('--one_directory', type=bool, default=False, help='MAXIMUM Batch size for computing embeddings (may go smaller)')
     parser.add_argument('--batch_size', type=int, default=64, help='MAXIMUM Batch size for computing embeddings (may go smaller)')
     parser.add_argument('--sample_size', type=int, default=2**18, help='Number of audio samples to read from each audio file')
     parser.add_argument('--chunk_size', type=int, default=24000, help='Length of chunks (in audio samples) to embed')
@@ -315,7 +427,10 @@ def main():
     parser.add_argument('--debug', action='store_true',  help='Extra messages for debugging this program')
 
     args = parser.parse_args()
-    embed(args)
+    if args.one_directory:
+        embed_one_directory(args)
+    else:
+        embed(args)
 
 # %% ../nbs/02_fad_embed.ipynb 12
 if __name__ == '__main__' and "get_ipython" not in dir():
